@@ -1,28 +1,24 @@
 #!/usr/bin/env python3
 """
-train_and_eval_resume.py
+train_and_eval_resume_v2.py
 
-Full training pipeline with exact resume support.
+Resume-capable training pipeline (best-effort true resume, fallback to weights-only fine-tune).
 
-Features:
- - Loads dataset in layout: dataset/{train,val,test}/images + annotations.csv
- - Trains ResNet-18 (optionally pretrained)
- - Saves last_checkpoint.pth each epoch (contains optimizer & scheduler & epoch)
- - Saves best_model.pth when validation accuracy improves
- - Supports --resume (full resume) and --resume_from (fine-tune model weights only)
+Behavior summary:
+ - If checkpoint contains 'epoch' + optimizer/scheduler states -> full resume (exact continuation).
+ - If checkpoint contains only 'model_state_dict' -> weights-only fine-tune (start_epoch = 1).
+ - Supports --resume (explicit checkpoint), --resume_from (weights-only), and --auto_resume (search output_dir).
+ - Writes last_checkpoint.pth each epoch and best_model.pth when val improves.
 
-Usage examples:
-  # fresh run
-  python train_and_eval_resume.py --dataset_dir dataset --output_dir results --epochs 30 --batch_size 64 --pretrained
+Usage:
+  # Full resume from an exact checkpoint
+  python train_and_eval_resume_v2.py --dataset_dir dataset --output_dir results --resume results/last_checkpoint.pth --epochs 1
 
-  # resume exact (if last_checkpoint.pth exists and previous run saved epoch=20)
-  python train_and_eval_resume.py --dataset_dir dataset --output_dir results --epochs 40 --resume results/last_checkpoint.pth
+  # Auto-resume (search output_dir)
+  python train_and_eval_resume_v2.py --dataset_dir dataset --output_dir results --auto_resume --epochs 1
 
-  # fine-tune from saved model weights (no optimizer state restored)
-  python train_and_eval_resume.py --dataset_dir dataset --output_dir results --epochs 10 --resume_from results/best_model.pth
-
-Requirements:
-  pip install torch torchvision pandas scikit-learn pillow matplotlib tqdm
+  # Fine-tune from weights-only file
+  python train_and_eval_resume_v2.py --dataset_dir dataset --output_dir results --resume_from results/best_model.pth --epochs 1
 """
 
 import os
@@ -56,9 +52,23 @@ def safe_int(v, default=0):
     except Exception:
         return default
 
+def checkpoint_inspect(path):
+    """
+    Loads checkpoint header and returns dict of keys present.
+    (We do a full torch.load but do not assume specific contents.)
+    """
+    try:
+        ck = torch.load(path, map_location="cpu")
+        if isinstance(ck, dict):
+            return ck
+        else:
+            # if it's a raw state_dict (mapping of tensors)
+            return {'model_state_dict': ck}
+    except Exception as e:
+        raise RuntimeError(f"Unable to load checkpoint {path}: {e}")
+
 # ---------------- dataset ----------------
 class BBoxClassificationDataset(Dataset):
-    """Crops bboxes from images; expects CSV with (filename,class_id,class_name,xmin,ymin,xmax,ymax) or variants."""
     def __init__(self, images_dir, annotations_csv, classid_to_idx, transform=None, bbox_pad=0):
         self.images_dir = images_dir
         self.transform = transform
@@ -94,7 +104,6 @@ class BBoxClassificationDataset(Dataset):
             fname = os.path.basename(str(fname))
             img_path = os.path.join(images_dir, fname)
             if not os.path.exists(img_path):
-                # recursive search
                 found = None
                 for root, _, files in os.walk(images_dir):
                     if fname in files:
@@ -245,18 +254,57 @@ def plot_confusion_matrix(cm, classes, outpath, normalize=True):
     plt.close()
 
 # ---------------- main training + resume logic ----------------
+def find_best_checkpoint(output_dir):
+    """
+    Auto-find best checkpoint in output_dir:
+      1) prefer last_checkpoint.pth if exists and contains epoch
+      2) prefer best_model.pth
+      3) prefer any *.pth, selecting the one that contains 'epoch' if possible
+    """
+    cand_last = os.path.join(output_dir, "last_checkpoint.pth")
+    cand_best = os.path.join(output_dir, "best_model.pth")
+    if os.path.exists(cand_last):
+        try:
+            ck = checkpoint_inspect(cand_last)
+            return cand_last, ck
+        except Exception:
+            pass
+    if os.path.exists(cand_best):
+        try:
+            ck = checkpoint_inspect(cand_best)
+            return cand_best, ck
+        except Exception:
+            pass
+    # search any .pth
+    pths = [os.path.join(output_dir, f) for f in os.listdir(output_dir) if f.lower().endswith(".pth")]
+    # try to find one with 'epoch' key first
+    for p in pths:
+        try:
+            ck = checkpoint_inspect(p)
+            if isinstance(ck, dict) and 'epoch' in ck:
+                return p, ck
+        except Exception:
+            continue
+    # fallback to first pth
+    for p in pths:
+        try:
+            ck = checkpoint_inspect(p)
+            return p, ck
+        except Exception:
+            continue
+    return None, None
+
 def train_and_eval(args):
     device = torch.device('cuda' if torch.cuda.is_available() and not args.no_cuda else 'cpu')
     print(f"[INFO] Device: {device}")
 
-    # class mapping
+    # collect class map
     csv_paths = [os.path.join(args.dataset_dir, s, 'annotations.csv') for s in ('train','val','test')]
     class_map = collect_class_map(csv_paths)
     if len(class_map) == 0:
         raise RuntimeError("No classes found in annotation CSVs.")
     print(f"[INFO] {len(class_map)} classes discovered.")
     classid_to_idx = {cid: idx for idx, cid in enumerate(class_map.keys())}
-    idx_to_name = [class_map[cid] for cid in classid_to_idx.keys()]
 
     # dataloaders
     loaders, datasets = build_dataloaders(args.dataset_dir, classid_to_idx, args.image_size, args.batch_size, args.bbox_pad, args.num_workers, device)
@@ -272,7 +320,6 @@ def train_and_eval(args):
     optimizer = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=0.9, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=3)
 
-    # checkpoint/resume setup
     ensure_dir(args.output_dir)
     last_checkpoint_path = os.path.join(args.output_dir, 'last_checkpoint.pth')
     best_model_path = os.path.join(args.output_dir, 'best_model.pth')
@@ -280,41 +327,62 @@ def train_and_eval(args):
     start_epoch = 1
     best_val_acc = 0.0
 
-    # Full resume (optimizer+scheduler+epoch) if provided
+    # determine checkpoint to load
+    ckpt_info = None
+    ckpt_path = None
     if args.resume:
-        if not os.path.exists(args.resume):
-            raise RuntimeError(f"Resume checkpoint not found: {args.resume}")
-        ckpt = torch.load(args.resume, map_location=device)
-        if 'model_state_dict' in ckpt:
-            model.load_state_dict(ckpt['model_state_dict'])
-        if 'optimizer_state_dict' in ckpt and ckpt['optimizer_state_dict'] is not None:
-            optimizer.load_state_dict(ckpt['optimizer_state_dict'])
-        if 'scheduler_state_dict' in ckpt and ckpt['scheduler_state_dict'] is not None:
-            try:
-                scheduler.load_state_dict(ckpt['scheduler_state_dict'])
-            except Exception as e:
-                print(f"[WARN] Could not restore scheduler state: {e}")
-        start_epoch = ckpt.get('epoch', 0) + 1
-        best_val_acc = float(ckpt.get('best_val_acc', 0.0))
-        print(f"[INFO] Resumed training from {args.resume} -> starting epoch {start_epoch}, best_val_acc={best_val_acc:.4f}")
-
-    # Fine-tune weights-only from a checkpoint, if provided
+        ckpt_path = args.resume
+        ckpt_info = checkpoint_inspect(ckpt_path)
     elif args.resume_from:
-        if not os.path.exists(args.resume_from):
-            raise RuntimeError(f"resume_from checkpoint not found: {args.resume_from}")
-        ckpt = torch.load(args.resume_from, map_location=device)
-        if 'model_state_dict' in ckpt:
-            model.load_state_dict(ckpt['model_state_dict'])
-            print(f"[INFO] Loaded model weights from {args.resume_from} (fine-tune).")
-        else:
-            # if checkpoint is just a state_dict
-            try:
-                model.load_state_dict(ckpt)
-                print(f"[INFO] Loaded raw state_dict from {args.resume_from} (fine-tune).")
-            except Exception:
-                raise RuntimeError(f"No usable model_state_dict found in {args.resume_from}")
+        ckpt_path = args.resume_from
+        ckpt_info = checkpoint_inspect(ckpt_path)
+    elif args.auto_resume:
+        ckpt_path, ckpt_info = find_best_checkpoint(args.output_dir)
+        if ckpt_path:
+            print(f"[INFO] Auto-resume selected checkpoint: {ckpt_path}")
+    # else nothing to load
 
-    # training loop
+    # apply resume logic
+    if ckpt_path and ckpt_info:
+        # if 'epoch' and optimizer/scheduler present -> full resume
+        if isinstance(ckpt_info, dict) and 'epoch' in ckpt_info and 'optimizer_state_dict' in ckpt_info:
+            print(f"[INFO] Performing FULL resume from checkpoint: {ckpt_path}")
+            # load model weights
+            if 'model_state_dict' in ckpt_info:
+                model.load_state_dict(ckpt_info['model_state_dict'])
+            else:
+                # sometimes checkpoint is only a raw state_dict
+                try:
+                    model.load_state_dict(ckpt_info)
+                except Exception as e:
+                    raise RuntimeError(f"Checkpoint at {ckpt_path} does not contain model_state_dict and could not be used: {e}")
+            # restore optimizer & scheduler
+            try:
+                optimizer.load_state_dict(ckpt_info['optimizer_state_dict'])
+                if 'scheduler_state_dict' in ckpt_info and ckpt_info['scheduler_state_dict'] is not None:
+                    scheduler.load_state_dict(ckpt_info['scheduler_state_dict'])
+            except Exception as e:
+                print(f"[WARN] Could not fully restore optimizer/scheduler state: {e}")
+            start_epoch = int(ckpt_info.get('epoch', 0)) + 1
+            best_val_acc = float(ckpt_info.get('best_val_acc', 0.0))
+            print(f"[INFO] Resumed: start_epoch={start_epoch}, best_val_acc={best_val_acc:.4f}")
+        else:
+            # weights-only or partial checkpoint -> fine-tune
+            print(f"[INFO] Checkpoint {ckpt_path} does not contain full optimizer/scheduler state. Proceeding with WEIGHTS-ONLY resume (fine-tune).")
+            # try to load model_state_dict if present
+            if isinstance(ckpt_info, dict) and 'model_state_dict' in ckpt_info:
+                model.load_state_dict(ckpt_info['model_state_dict'])
+            else:
+                # raw state_dict; try to load directly
+                try:
+                    model.load_state_dict(ckpt_info)
+                except Exception as e:
+                    raise RuntimeError(f"Could not load model weights from checkpoint {ckpt_path}: {e}")
+            start_epoch = 1
+            best_val_acc = float(ckpt_info.get('best_val_acc', 0.0)) if isinstance(ckpt_info, dict) and 'best_val_acc' in ckpt_info else 0.0
+            print(f"[WARN] Starting fine-tune from weights; optimizer/scheduler state not restored. start_epoch={start_epoch}")
+
+    # Training loop (start_epoch determined)
     train_log = []
     num_epochs = args.epochs
     for epoch in range(start_epoch, num_epochs + 1):
@@ -376,7 +444,7 @@ def train_and_eval(args):
         }
         torch.save(ckpt, last_checkpoint_path)
 
-        # Save best model (also include optimizer & scheduler for completeness)
+        # Save best model (include optimizer & scheduler)
         if val_acc is not None and val_acc > best_val_acc:
             best_val_acc = val_acc
             best_ckpt = dict(ckpt)
@@ -384,13 +452,10 @@ def train_and_eval(args):
             torch.save(best_ckpt, best_model_path)
             print(f"[INFO] New best model (val_acc={best_val_acc:.4f}) saved to {best_model_path}")
 
-    # end epochs
-    # final save if no best saved earlier
+    # final housekeeping
     if not os.path.exists(best_model_path):
-        print("[INFO] No best model saved during training -- saving last checkpoint as best_model.pth")
         torch.save(ckpt, best_model_path)
 
-    # save train log
     pd.DataFrame(train_log).to_csv(os.path.join(args.output_dir, 'train_log.csv'), index=False)
 
     # evaluation on test set
@@ -398,7 +463,6 @@ def train_and_eval(args):
         print("[WARN] No test split found; skipping final evaluation.")
         return
 
-    # load best model for evaluation
     ckpt_eval = torch.load(best_model_path, map_location=device)
     model.load_state_dict(ckpt_eval['model_state_dict'])
     model.to(device)
@@ -408,14 +472,12 @@ def train_and_eval(args):
     cls_report = classification_report(gts, preds, output_dict=True, zero_division=0)
     cm = confusion_matrix(gts, preds)
 
-    # write classification report CSV
     rows = []
     for label_idx, metrics in cls_report.items():
         if label_idx == 'accuracy': continue
         rows.append({'label': label_idx, **metrics})
     pd.DataFrame(rows).to_csv(os.path.join(args.output_dir, 'classification_report.csv'), index=False)
 
-    # build idx->name mapping
     idx_to_name = [None] * len(classid_to_idx)
     for cid, idx in classid_to_idx.items():
         idx_to_name[idx] = class_map.get(cid, str(cid))
@@ -433,9 +495,9 @@ def train_and_eval(args):
 
 # ---------------- CLI ----------------
 def parse_args():
-    p = argparse.ArgumentParser(description="Train ResNet-18 on bbox-cropped traffic sign dataset and support full resume.")
+    p = argparse.ArgumentParser(description="Train ResNet-18 on bbox-cropped traffic sign dataset with robust resume.")
     p.add_argument("--dataset_dir", type=str, default="dataset", help="Dataset root with train/val/test subfolders.")
-    p.add_argument("--output_dir", type=str, default="results", help="Where to store outputs (checkpoints, metrics).")
+    p.add_argument("--output_dir", type=str, default="results", help="Where to store outputs.")
     p.add_argument("--epochs", type=int, default=12, help="Total number of epochs to run (if resuming, will start from saved epoch+1).")
     p.add_argument("--batch_size", type=int, default=64)
     p.add_argument("--lr", type=float, default=0.01)
@@ -444,8 +506,9 @@ def parse_args():
     p.add_argument("--bbox_pad", type=int, default=0)
     p.add_argument("--num_workers", type=int, default=4)
     p.add_argument("--no_cuda", action='store_true', help="Disable CUDA even if available.")
-    p.add_argument("--resume", type=str, default=None, help="Path to checkpoint (full resume: model+optimizer+scheduler+epoch).")
+    p.add_argument("--resume", type=str, default=None, help="Path to checkpoint for full resume (model+optimizer+scheduler+epoch).")
     p.add_argument("--resume_from", type=str, default=None, help="Path to checkpoint to load model weights only (fine-tune).")
+    p.add_argument("--auto_resume", action='store_true', help="Auto-find a checkpoint in output_dir to resume from.")
     return p.parse_args()
 
 if __name__ == "__main__":
