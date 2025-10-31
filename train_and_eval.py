@@ -1,30 +1,3 @@
-#!/usr/bin/env python3
-"""
-train_and_eval_resume.py
-
-Full training pipeline with exact resume support.
-
-Features:
- - Loads dataset in layout: dataset/{train,val,test}/images + annotations.csv
- - Trains ResNet-18 (optionally pretrained)
- - Saves last_checkpoint.pth each epoch (contains optimizer & scheduler & epoch)
- - Saves best_model.pth when validation accuracy improves
- - Supports --resume (full resume) and --resume_from (fine-tune model weights only)
-
-Usage examples:
-  # fresh run
-  python train_and_eval_resume.py --dataset_dir dataset --output_dir results --epochs 30 --batch_size 64 --pretrained
-
-  # resume exact (if last_checkpoint.pth exists and previous run saved epoch=20)
-  python train_and_eval_resume.py --dataset_dir dataset --output_dir results --epochs 40 --resume results/last_checkpoint.pth
-
-  # fine-tune from saved model weights (no optimizer state restored)
-  python train_and_eval_resume.py --dataset_dir dataset --output_dir results --epochs 10 --resume_from results/best_model.pth
-
-Requirements:
-  pip install torch torchvision pandas scikit-learn pillow matplotlib tqdm
-"""
-
 import os
 import json
 import argparse
@@ -45,7 +18,6 @@ from torchvision import transforms, models
 
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
 
-# ---------------- utilities ----------------
 def ensure_dir(path):
     if not os.path.exists(path):
         os.makedirs(path, exist_ok=True)
@@ -56,9 +28,7 @@ def safe_int(v, default=0):
     except Exception:
         return default
 
-# ---------------- dataset ----------------
 class BBoxClassificationDataset(Dataset):
-    """Crops bboxes from images; expects CSV with (filename,class_id,class_name,xmin,ymin,xmax,ymax) or variants."""
     def __init__(self, images_dir, annotations_csv, classid_to_idx, transform=None, bbox_pad=0):
         self.images_dir = images_dir
         self.transform = transform
@@ -94,7 +64,6 @@ class BBoxClassificationDataset(Dataset):
             fname = os.path.basename(str(fname))
             img_path = os.path.join(images_dir, fname)
             if not os.path.exists(img_path):
-                # recursive search
                 found = None
                 for root, _, files in os.walk(images_dir):
                     if fname in files:
@@ -144,7 +113,6 @@ class BBoxClassificationDataset(Dataset):
         label = int(s['class_idx'])
         return crop, label
 
-# ---------------- transforms and loaders ----------------
 def make_transforms(image_size):
     train_tf = transforms.Compose([
         transforms.Resize((int(image_size * 1.2), int(image_size * 1.2))),
@@ -207,7 +175,6 @@ def build_dataloaders(dataset_dir, classid_to_idx, image_size, batch_size, bbox_
         print(f"[INFO] {split}: {len(ds)} samples, batches={len(loader)}")
     return loaders, datasets
 
-# ---------------- evaluation helpers ----------------
 def evaluate_model(model, dataloader, device):
     model.eval()
     preds, gts = [], []
@@ -244,12 +211,10 @@ def plot_confusion_matrix(cm, classes, outpath, normalize=True):
     plt.savefig(outpath, bbox_inches='tight', dpi=200)
     plt.close()
 
-# ---------------- main training + resume logic ----------------
 def train_and_eval(args):
     device = torch.device('cuda' if torch.cuda.is_available() and not args.no_cuda else 'cpu')
     print(f"[INFO] Device: {device}")
 
-    # class mapping
     csv_paths = [os.path.join(args.dataset_dir, s, 'annotations.csv') for s in ('train','val','test')]
     class_map = collect_class_map(csv_paths)
     if len(class_map) == 0:
@@ -258,12 +223,10 @@ def train_and_eval(args):
     classid_to_idx = {cid: idx for idx, cid in enumerate(class_map.keys())}
     idx_to_name = [class_map[cid] for cid in classid_to_idx.keys()]
 
-    # dataloaders
     loaders, datasets = build_dataloaders(args.dataset_dir, classid_to_idx, args.image_size, args.batch_size, args.bbox_pad, args.num_workers, device)
     if loaders.get('train') is None:
         raise RuntimeError("Training data not found.")
 
-    # model + optimizer + scheduler
     model = models.resnet18(pretrained=args.pretrained)
     model.fc = nn.Linear(model.fc.in_features, len(classid_to_idx))
     model = model.to(device)
@@ -272,7 +235,6 @@ def train_and_eval(args):
     optimizer = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=0.9, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=3)
 
-    # checkpoint/resume setup
     ensure_dir(args.output_dir)
     last_checkpoint_path = os.path.join(args.output_dir, 'last_checkpoint.pth')
     best_model_path = os.path.join(args.output_dir, 'best_model.pth')
@@ -280,7 +242,6 @@ def train_and_eval(args):
     start_epoch = 1
     best_val_acc = 0.0
 
-    # Full resume (optimizer+scheduler+epoch) if provided
     if args.resume:
         if not os.path.exists(args.resume):
             raise RuntimeError(f"Resume checkpoint not found: {args.resume}")
@@ -298,7 +259,6 @@ def train_and_eval(args):
         best_val_acc = float(ckpt.get('best_val_acc', 0.0))
         print(f"[INFO] Resumed training from {args.resume} -> starting epoch {start_epoch}, best_val_acc={best_val_acc:.4f}")
 
-    # Fine-tune weights-only from a checkpoint, if provided
     elif args.resume_from:
         if not os.path.exists(args.resume_from):
             raise RuntimeError(f"resume_from checkpoint not found: {args.resume_from}")
@@ -307,14 +267,12 @@ def train_and_eval(args):
             model.load_state_dict(ckpt['model_state_dict'])
             print(f"[INFO] Loaded model weights from {args.resume_from} (fine-tune).")
         else:
-            # if checkpoint is just a state_dict
             try:
                 model.load_state_dict(ckpt)
                 print(f"[INFO] Loaded raw state_dict from {args.resume_from} (fine-tune).")
             except Exception:
                 raise RuntimeError(f"No usable model_state_dict found in {args.resume_from}")
 
-    # training loop
     train_log = []
     num_epochs = args.epochs
     for epoch in range(start_epoch, num_epochs + 1):
@@ -341,7 +299,6 @@ def train_and_eval(args):
         train_loss = running_loss / total if total > 0 else 0.0
         train_acc = correct / total if total > 0 else 0.0
 
-        # validation
         val_loss = None; val_acc = None
         if loaders.get('val') is not None:
             model.eval()
@@ -364,7 +321,6 @@ def train_and_eval(args):
         print(f"Epoch {epoch}: train_loss={train_loss:.4f}, train_acc={train_acc:.4f}, val_loss={val_loss_str}, val_acc={val_acc_str}")
         train_log.append({'epoch': epoch, 'train_loss': train_loss, 'train_acc': train_acc, 'val_loss': val_loss, 'val_acc': val_acc})
 
-        # Save last checkpoint (exact resume)
         ckpt = {
             'epoch': epoch,
             'model_state_dict': model.state_dict(),
@@ -376,7 +332,6 @@ def train_and_eval(args):
         }
         torch.save(ckpt, last_checkpoint_path)
 
-        # Save best model (also include optimizer & scheduler for completeness)
         if val_acc is not None and val_acc > best_val_acc:
             best_val_acc = val_acc
             best_ckpt = dict(ckpt)
@@ -384,21 +339,16 @@ def train_and_eval(args):
             torch.save(best_ckpt, best_model_path)
             print(f"[INFO] New best model (val_acc={best_val_acc:.4f}) saved to {best_model_path}")
 
-    # end epochs
-    # final save if no best saved earlier
     if not os.path.exists(best_model_path):
         print("[INFO] No best model saved during training -- saving last checkpoint as best_model.pth")
         torch.save(ckpt, best_model_path)
 
-    # save train log
     pd.DataFrame(train_log).to_csv(os.path.join(args.output_dir, 'train_log.csv'), index=False)
 
-    # evaluation on test set
     if loaders.get('test') is None:
         print("[WARN] No test split found; skipping final evaluation.")
         return
 
-    # load best model for evaluation
     ckpt_eval = torch.load(best_model_path, map_location=device)
     model.load_state_dict(ckpt_eval['model_state_dict'])
     model.to(device)
@@ -408,14 +358,12 @@ def train_and_eval(args):
     cls_report = classification_report(gts, preds, output_dict=True, zero_division=0)
     cm = confusion_matrix(gts, preds)
 
-    # write classification report CSV
     rows = []
     for label_idx, metrics in cls_report.items():
         if label_idx == 'accuracy': continue
         rows.append({'label': label_idx, **metrics})
     pd.DataFrame(rows).to_csv(os.path.join(args.output_dir, 'classification_report.csv'), index=False)
 
-    # build idx->name mapping
     idx_to_name = [None] * len(classid_to_idx)
     for cid, idx in classid_to_idx.items():
         idx_to_name[idx] = class_map.get(cid, str(cid))
@@ -431,7 +379,6 @@ def train_and_eval(args):
     print(f"[RESULT] Test accuracy: {test_acc:.4f} on {len(gts)} samples")
     print(f"[INFO] Artifacts saved to: {args.output_dir}")
 
-# ---------------- CLI ----------------
 def parse_args():
     p = argparse.ArgumentParser(description="Train ResNet-18 on bbox-cropped traffic sign dataset and support full resume.")
     p.add_argument("--dataset_dir", type=str, default="dataset", help="Dataset root with train/val/test subfolders.")

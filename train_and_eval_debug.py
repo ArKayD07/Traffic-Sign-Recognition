@@ -1,14 +1,3 @@
-#!/usr/bin/env python3
-"""
-train_and_eval_debug.py
-
-Verbose debug version of the training pipeline. Use this when the main script
-exits with no visible output — it prints dataset diagnostics and logs exceptions.
-
-Usage:
-    python train_and_eval_debug.py --dataset_dir dataset --output_dir results --epochs 2
-"""
-
 import os, sys, traceback, json, argparse, shutil
 from collections import OrderedDict, defaultdict
 import itertools
@@ -25,7 +14,6 @@ from torchvision import transforms, models
 
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
 
-# ---------- helpers ----------
 def ensure_dir(p):
     if not os.path.exists(p):
         os.makedirs(p, exist_ok=True)
@@ -42,7 +30,6 @@ def log(msg, logfile=None):
         with open(logfile, "a", encoding="utf-8") as f:
             f.write(msg + "\n")
 
-# ---------- minimal dataset checks ----------
 def list_folder_sample(path, n=10):
     try:
         items = os.listdir(path)
@@ -57,7 +44,6 @@ def read_csv_head(path, n=6):
     except Exception as e:
         return f"<error reading {path}: {e}>", None
 
-# ---------- BBox dataset (same as before but minimal) ----------
 class BBoxClassificationDataset(Dataset):
     def __init__(self, images_dir, annotations_csv, classid_to_idx, transform=None, bbox_pad=0, debug_log=None):
         self.images_dir = images_dir
@@ -73,7 +59,6 @@ class BBoxClassificationDataset(Dataset):
         if df.shape[0] == 0:
             raise RuntimeError(f"Annotations CSV is empty: {annotations_csv}")
 
-        # normalize column mapping (case-insensitive)
         cols = {c.lower(): c for c in df.columns}
         def col(name):
             return cols.get(name, None)
@@ -91,10 +76,8 @@ class BBoxClassificationDataset(Dataset):
             if pd.isna(fname) or fname is None:
                 continue
             fname = os.path.basename(str(fname))
-            # locate image
             img_path = os.path.join(images_dir, fname)
             if not os.path.exists(img_path):
-                # one-time recursive search
                 found = None
                 for root, _, files in os.walk(images_dir):
                     if fname in files:
@@ -134,7 +117,6 @@ class BBoxClassificationDataset(Dataset):
         label = int(s['class_idx'])
         return crop, label
 
-# ---------- other helpers ----------
 def collect_class_map(csv_paths):
     mapping = OrderedDict()
     for p in csv_paths:
@@ -184,15 +166,12 @@ def build_loaders(dataset_dir, classid_to_idx, image_size, batch_size, bbox_pad,
         log(f"[INFO] {split}: {len(ds)} samples, {len(loader)} batches", debug_log)
     return loaders
 
-# ---------- training main (very minimal) ----------
 def train_and_eval_debug(args, debug_log):
     log(f"[START] train_and_eval_debug (pid={os.getpid()})", debug_log)
     log(f"Args: {args}", debug_log)
 
-    # validate dataset_dir
     if not os.path.isdir(args.dataset_dir):
         raise RuntimeError(f"dataset_dir not found: {args.dataset_dir}")
-    # locate master CSVs (prefer dataset/all_images/all_annotations.csv)
     possible = [os.path.join(args.dataset_dir,'all_images','all_annotations.csv'),
                 os.path.join(args.dataset_dir,'annotations.csv')]
     master = args.master_csv if args.master_csv and os.path.exists(args.master_csv) else None
@@ -201,13 +180,11 @@ def train_and_eval_debug(args, debug_log):
             if os.path.exists(p):
                 master = p; break
     if not master:
-        # fallback: any csv with 'annot' in name
         for f in os.listdir(args.dataset_dir):
             if f.lower().endswith('.csv') and 'annot' in f.lower():
                 master = os.path.join(args.dataset_dir, f); break
     log(f"[INFO] Master CSV: {master}", debug_log)
 
-    # quick listings
     log(f"Top-level dataset files: {list_folder_sample(args.dataset_dir, 20)}", debug_log)
     log(f"train/images sample: {list_folder_sample(os.path.join(args.dataset_dir,'train','images'), 10)}", debug_log)
     log(f"val/images sample: {list_folder_sample(os.path.join(args.dataset_dir,'val','images'), 10)}", debug_log)
@@ -218,15 +195,12 @@ def train_and_eval_debug(args, debug_log):
         log(f"Master CSV header: {hdr}", debug_log)
         log(f"Master CSV sample rows: {head}", debug_log)
 
-    # collect classes
     csv_paths = [os.path.join(args.dataset_dir, s, 'annotations.csv') for s in ('train','val','test')]
     class_map = collect_class_map(csv_paths)
     log(f"Collected class map (from splits): {class_map}", debug_log)
     if len(class_map)==0 and master:
-        # try master CSV
         try:
             df = pd.read_csv(master)
-            # try to infer class map quickly: use class_id/class_name columns
             cols = {c.lower():c for c in df.columns}
             id_col = cols.get('class_id') or cols.get('class') or None
             name_col = cols.get('class_name') or cols.get('label') or None
@@ -246,21 +220,18 @@ def train_and_eval_debug(args, debug_log):
     classid_to_idx = {cid: idx for idx, cid in enumerate(class_map.keys())}
     log(f"[INFO] classid_to_idx: {classid_to_idx}", debug_log)
 
-    # build loaders
     device = torch.device('cuda' if torch.cuda.is_available() and not args.no_cuda else 'cpu')
     loaders = build_loaders(args.dataset_dir, classid_to_idx, args.image_size, args.batch_size, args.bbox_pad, args.num_workers, device)
     if loaders.get('train', None) is None:
         raise RuntimeError("Train loader not available. Check your train/images and train/annotations.csv.")
 
     log("[INFO] Starting a single training epoch (debug) to test pipeline", debug_log)
-    # minimal: run one epoch pass and then evaluate a batch to confirm everything runs
     model = models.resnet18(pretrained=False)
     model.fc = nn.Linear(model.fc.in_features, len(classid_to_idx))
     model.to(device)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.9)
     criterion = nn.CrossEntropyLoss()
 
-    # one epoch
     model.train()
     for images, labels in tqdm(loaders['train'], desc="DebugTrainEpoch", total=min(50, len(loaders['train']))):
         images = images.to(device); labels = labels.to(device)
@@ -269,12 +240,10 @@ def train_and_eval_debug(args, debug_log):
         loss = criterion(outputs, labels)
         loss.backward()
         optimizer.step()
-        # break quickly after a few batches to avoid long runs in debug
         break
 
     log("[INFO] Single-batch training step finished.", debug_log)
 
-    # quick eval on one batch from val or train
     eval_loader = loaders.get('val') or loaders.get('train')
     if eval_loader is None:
         log("[WARN] No eval loader available", debug_log)
@@ -291,7 +260,6 @@ def train_and_eval_debug(args, debug_log):
 
     log("[COMPLETE] Debug run succeeded. Proceed with full training script next.", debug_log)
 
-# ---------- CLI ----------
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset_dir", type=str, default="dataset")
@@ -306,7 +274,6 @@ if __name__ == "__main__":
 
     debug_log = os.path.join(args.output_dir, "debug.log")
     ensure_dir(args.output_dir)
-    # clear or create debug log
     with open(debug_log, "w", encoding="utf-8") as f: 
         f.write(f"Debug log started\n")
 

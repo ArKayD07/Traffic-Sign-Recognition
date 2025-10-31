@@ -1,15 +1,3 @@
-#!/usr/bin/env python3
-"""
-convert_annotations.py (prefer dataset/all_images/all_annotations.csv)
-
-Usage:
-    python convert_annotations.py --dataset_dir dataset --output_dir converted_dataset
-    python convert_annotations.py --dataset_dir dataset --output_dir converted_dataset --master_csv dataset/all_images/all_annotations.csv
-
-Requirements:
-    pip install pillow tqdm
-"""
-
 import os
 import shutil
 import csv
@@ -22,8 +10,6 @@ from PIL import Image
 from tqdm import tqdm
 
 random.seed(42)
-
-# ------------------ Utilities ------------------ #
 
 def ensure_dir(path):
     if not os.path.exists(path):
@@ -46,8 +32,6 @@ def write_csv_rows(csv_path, header, rows):
         for r in rows:
             writer.writerow(r)
 
-# ------------------ Master CSV discovery ------------------ #
-
 def prefer_master_csv(dataset_dir, explicit_master=None):
     """
     Preference order:
@@ -68,18 +52,14 @@ def prefer_master_csv(dataset_dir, explicit_master=None):
     if os.path.exists(cand2):
         return cand2
 
-    # search for any CSV with 'annot' in the filename
     for fname in os.listdir(dataset_dir):
         if fname.lower().endswith(".csv") and "annot" in fname.lower():
             return os.path.join(dataset_dir, fname)
 
     return None
 
-# ------------------ Matching & parsing helpers ------------------ #
-
 def parse_row_fields(row):
     """Normalize a CSV row to {filename, class_id, class_name, bbox} or return None."""
-    # find filename-like field
     fname_keys = ['filename', 'file', 'image', 'image_name', 'img', 'path']
     fname = None
     for k in fname_keys:
@@ -87,7 +67,6 @@ def parse_row_fields(row):
             fname = os.path.basename(row[k].strip())
             break
     if not fname:
-        # fallback: find any field that looks like a jpg/png path
         for k, v in row.items():
             if isinstance(v, str) and v.lower().endswith(('.jpg', '.jpeg', '.png')):
                 fname = os.path.basename(v.strip())
@@ -95,7 +74,6 @@ def parse_row_fields(row):
     if not fname:
         return None
 
-    # class id
     cid = None
     if 'class_id' in row and row['class_id'] != '':
         try:
@@ -103,14 +81,12 @@ def parse_row_fields(row):
         except Exception:
             cid = None
 
-    # class name
     cname = row.get('class_name') or row.get('class') or row.get('label') or ''
     try:
         cname = cname.strip()
     except Exception:
         cname = str(cname)
 
-    # bbox
     try:
         xmin = int(float(row.get('xmin', row.get('x1', 0))))
         ymin = int(float(row.get('ymin', row.get('y1', 0))))
@@ -121,10 +97,7 @@ def parse_row_fields(row):
 
     return {'filename': fname, 'class_id': cid if cid is not None else -1, 'class_name': cname, 'bbox': [xmin, ymin, xmax, ymax], 'orig': row}
 
-# ------------------ Image discovery & heuristic matching ------------------ #
-
 def discover_images_map(dataset_dir):
-    """Return mapping basename -> list of full paths (in case duplicate names exist in different folders)."""
     mapping = {}
     for root, _, files in os.walk(dataset_dir):
         for f in files:
@@ -133,15 +106,9 @@ def discover_images_map(dataset_dir):
     return mapping
 
 def match_master_rows_to_images(master_rows, image_map):
-    """
-    Use multi-step heuristics to match master CSV rows to discovered images.
-    Returns:
-      matched_rows: list of parsed rows with filename replaced by matched basename
-      unmatched: list of parsed rows that couldn't be matched
-    """
+
     parsed = []
     unmatched = []
-    # Build lower-case key map for case-insensitive matching
     lc_map = {k.lower(): k for k in image_map.keys()}
 
     for r in master_rows:
@@ -151,27 +118,22 @@ def match_master_rows_to_images(master_rows, image_map):
         base = p['filename']
         matched_key = None
 
-        # heuristic 1: exact basename
         if base in image_map:
             matched_key = base
         else:
-            # heuristic 2: case-insensitive basename
             if base.lower() in lc_map:
                 matched_key = lc_map[base.lower()]
             else:
-                # heuristic 3: stem match (filename without extension)
                 stem = os.path.splitext(base)[0]
                 for key in image_map.keys():
                     if os.path.splitext(key)[0] == stem:
                         matched_key = key
                         break
-                # heuristic 4: substring matches
                 if matched_key is None:
                     for key in image_map.keys():
                         if (base in key) or (key in base):
                             matched_key = key
                             break
-                # heuristic 5: startswith/endswith on stems
                 if matched_key is None:
                     for key in image_map.keys():
                         s_key = os.path.splitext(key)[0]
@@ -187,22 +149,13 @@ def match_master_rows_to_images(master_rows, image_map):
 
     return parsed, unmatched
 
-# ------------------ Splitting & writing ------------------ #
-
 def stratified_split_and_copy(dataset_dir, parsed_rows, splits=('train', 'val', 'test'), ratios=(0.7, 0.2, 0.1)):
-    """
-    parsed_rows: list of parsed rows (filename basenames standardized)
-    Copies images into dataset/<split>/images and returns a dict split->rows (rows are original-style dicts).
-    """
-    # group parsed rows by filename (preserve multiple objects)
     by_file = defaultdict(list)
     for p in parsed_rows:
         by_file[p['filename']].append(p)
 
-    # pick a primary class per image for stratified sampling (mode or first)
     primary = {}
     for fname, anns in by_file.items():
-        # choose the most common class_id among annotations for that image
         counts = defaultdict(int)
         for a in anns:
             counts[a['class_id']] += 1
@@ -211,7 +164,6 @@ def stratified_split_and_copy(dataset_dir, parsed_rows, splits=('train', 'val', 
     filenames = list(by_file.keys())
     labels = [primary[f] for f in filenames]
 
-    # simple stratified split using deterministic approach (we'll shuffle per class)
     class_groups = defaultdict(list)
     for fn in filenames:
         class_groups[primary[fn]].append(fn)
@@ -228,46 +180,35 @@ def stratified_split_and_copy(dataset_dir, parsed_rows, splits=('train', 'val', 
 
     split_map = {'train': train_files, 'val': val_files, 'test': test_files}
 
-    # prepare directories and copy images
     for split in splits:
         out_dir = os.path.join(dataset_dir, split, 'images')
         ensure_dir(out_dir)
         for fn in split_map[split]:
-            # choose first discovered path for that filename (image discovery may have multiple)
-            # master image should be found in discover_images_map earlier
-            # find full path by walking dataset_dir again (or pass a map). We'll search quickly.
             src = None
             for root, _, files in os.walk(dataset_dir):
                 if fn in files:
                     src = os.path.join(root, fn)
                     break
             if src is None:
-                # this should not happen; but skip if missing
                 print(f"[WARN] Could not find source file for {fn} when copying to split {split}")
                 continue
             dst = os.path.join(out_dir, fn)
             if os.path.abspath(src) != os.path.abspath(dst):
                 shutil.copyfile(src, dst)
 
-    # build per-split row lists in CSV-friendly format
     split_rows = {s: [] for s in splits}
     for split in splits:
         for fn in split_map[split]:
             for ann in by_file[fn]:
-                # flatten to standard CSV record; prefer original 'orig' row mapping if present
                 orig = ann.get('orig', None)
                 if orig:
-                    # ensure filename field uses the basename only
-                    # find first filename-like key in orig and set to basename
                     newrow = dict(orig)
                     for key in ('filename', 'file', 'image', 'image_name', 'path'):
                         if key in newrow:
                             newrow[key] = ann['filename']
-                    # ensure bbox fields exist
                     for key in ('xmin','ymin','xmax','ymax'):
                         if key not in newrow:
                             newrow[key] = ann['bbox'][('xmin','ymin','xmax','ymax').index(key)]
-                    # ensure class fields exist
                     if 'class_id' not in newrow or newrow['class_id']=='':
                         newrow['class_id'] = ann['class_id']
                     if 'class_name' not in newrow or newrow['class_name']=='':
@@ -286,8 +227,7 @@ def stratified_split_and_copy(dataset_dir, parsed_rows, splits=('train', 'val', 
 
     return split_rows
 
-# ------------------ Conversion (VOC/YOLO/COCO) ------------------ #
-
+#Conversion (VOC/YOLO/COCO)
 def write_voc_xml(image_info, annotations, out_xml_path):
     root = Element('annotation')
     SubElement(root, 'folder').text = image_info.get('folder', '')
@@ -331,8 +271,6 @@ def make_coco_annotation(ann_id, image_id, ann, classid_map):
     bbox = [xmin, ymin, w, h]
     return {"id": ann_id, "image_id": image_id, "category_id": int(classid_map.get(ann['class_id'], 0)), "bbox": [float(x) for x in bbox], "area": float(w * h), "iscrowd": 0, "segmentation": []}
 
-# ------------------ Main pipeline ------------------ #
-
 def convert_annotations(dataset_dir, output_dir, master_csv_arg=None, splits=('train', 'val', 'test')):
     dataset_dir = os.path.abspath(dataset_dir)
     ensure_dir(output_dir)
@@ -342,12 +280,10 @@ def convert_annotations(dataset_dir, output_dir, master_csv_arg=None, splits=('t
         raise RuntimeError(f"No master annotations CSV found (looked for --master_csv, dataset/all_images/all_annotations.csv, dataset/annotations.csv, or any CSV with 'annot' in name).")
     print(f"[INFO] Using master CSV: {master_csv}")
 
-    # Discover images
     image_map = discover_images_map(dataset_dir)
     if len(image_map) == 0:
         raise RuntimeError("No image files found under dataset directory.")
 
-    # If no per-split images exist, create splits using master CSV rows matched to discovered images
     any_split_images = any(os.path.isdir(os.path.join(dataset_dir, s, 'images')) and len([f for f in os.listdir(os.path.join(dataset_dir, s, 'images')) if f.lower().endswith(('.jpg','.jpeg','.png'))]) > 0 for s in splits)
 
     if not any_split_images:
@@ -356,9 +292,7 @@ def convert_annotations(dataset_dir, output_dir, master_csv_arg=None, splits=('t
         print(f"[INFO] Matched {len(parsed)} rows to discovered images; {len(unmatched)} rows unmatched.")
         if len(parsed) == 0:
             raise RuntimeError("No master CSV rows matched available images. Inspect CSV filenames vs image filenames.")
-        # create stratified splits and copy images into dataset/<split>/images/
         split_rows = stratified_split_and_copy(dataset_dir, parsed, splits=splits)
-        # write per-split CSVs (CSV header standardized)
         header = ["filename", "class_id", "class_name", "xmin", "ymin", "xmax", "ymax"]
         for s in splits:
             rows = split_rows.get(s, [])
@@ -368,13 +302,11 @@ def convert_annotations(dataset_dir, output_dir, master_csv_arg=None, splits=('t
             print(f"[INFO] Wrote {len(rows)} rows to {os.path.join(dataset_dir, s, 'annotations.csv')}")
     else:
         print("[INFO] Per-split image folders detected; will use existing split folders and create split CSVs if missing.")
-        # if split CSVs missing, build them by filtering master CSV for images in each split folder
         for s in splits:
             csv_path = os.path.join(dataset_dir, s, "annotations.csv")
             if os.path.exists(csv_path):
                 print(f"[OK] Found existing CSV for split '{s}': {csv_path}")
                 continue
-            # find images in split
             img_dir1 = os.path.join(dataset_dir, s, "images")
             img_dir2 = os.path.join(dataset_dir, "images", s)
             img_dir = img_dir1 if os.path.isdir(img_dir1) else (img_dir2 if os.path.isdir(img_dir2) else None)
@@ -386,7 +318,6 @@ def convert_annotations(dataset_dir, output_dir, master_csv_arg=None, splits=('t
             master_rows, header = read_csv_rows(master_csv)
             filtered = []
             for r in master_rows:
-                # attempt to extract basename from row
                 fname = None
                 for key in ('filename', 'file', 'image', 'image_name', 'path'):
                     if key in r and r[key]:
@@ -398,7 +329,6 @@ def convert_annotations(dataset_dir, output_dir, master_csv_arg=None, splits=('t
                 write_csv_rows(csv_path, header or ["filename","class_id","class_name","xmin","ymin","xmax","ymax"], filtered)
                 print(f"[INFO] Wrote {len(filtered)} rows to {csv_path}")
 
-    # Now collect classes from per-split CSVs (or master)
     split_csvs = []
     for s in splits:
         p = os.path.join(dataset_dir, s, "annotations.csv")
@@ -428,7 +358,6 @@ def convert_annotations(dataset_dir, output_dir, master_csv_arg=None, splits=('t
     classid_map = {cid: idx for idx, cid in enumerate(dataset_class_ids)}
     class_names = [classid_name[cid] for cid in dataset_class_ids]
 
-    # write classes.names
     ensure_dir(os.path.join(output_dir, 'yolo'))
     class_names_path = os.path.join(output_dir, 'yolo', 'classes.names')
     with open(class_names_path, 'w', encoding='utf-8') as f:
@@ -436,7 +365,6 @@ def convert_annotations(dataset_dir, output_dir, master_csv_arg=None, splits=('t
             f.write(n + '\n')
     print(f"[INFO] Wrote classes.names ({len(class_names)} classes) -> {class_names_path}")
 
-    # Convert each split
     for s in splits:
         csv_path = os.path.join(dataset_dir, s, "annotations.csv")
         img_dir1 = os.path.join(dataset_dir, s, "images")
@@ -476,12 +404,10 @@ def convert_annotations(dataset_dir, output_dir, master_csv_arg=None, splits=('t
                 print(f"  [ERROR] cannot open {src_img}: {ex} -> skipping")
                 continue
 
-            # VOC
             voc_annotations = [{'class_name': a['class_name'] or str(a['class_id']), 'bbox': a['bbox']} for a in ann_list]
             xml_path = os.path.join(voc_out, os.path.splitext(fname)[0] + '.xml')
             write_voc_xml({'filename': fname, 'width': w, 'height': h, 'depth': 3, 'folder': os.path.basename(voc_out), 'path': os.path.abspath(src_img)}, voc_annotations, xml_path)
 
-            # YOLO: copy image + write label file
             dst_img = os.path.join(yolo_images_out, fname)
             if os.path.abspath(src_img) != os.path.abspath(dst_img):
                 shutil.copyfile(src_img, dst_img)
@@ -493,7 +419,6 @@ def convert_annotations(dataset_dir, output_dir, master_csv_arg=None, splits=('t
             with open(os.path.join(yolo_labels_out, os.path.splitext(fname)[0] + '.txt'), 'w', encoding='utf-8') as lf:
                 lf.write("\n".join(yolo_lines))
 
-            # COCO entries
             coco_images.append({"id": img_id, "file_name": fname, "width": w, "height": h})
             for a in ann_list:
                 coco_ann = make_coco_annotation(ann_id, img_id, a, classid_map)
@@ -502,7 +427,6 @@ def convert_annotations(dataset_dir, output_dir, master_csv_arg=None, splits=('t
                     ann_id += 1
             img_id += 1
 
-        # write COCO json
         coco_path = os.path.join(coco_out_dir, f"{s}.json")
         coco_dict = {"images": coco_images, "annotations": coco_annotations, "categories": [{"id": classid_map[cid], "name": classid_name[cid]} for cid in dataset_class_ids]}
         with open(coco_path, 'w', encoding='utf-8') as cf:
@@ -510,8 +434,6 @@ def convert_annotations(dataset_dir, output_dir, master_csv_arg=None, splits=('t
         print(f"[OK] Split '{s}' converted. VOC:{voc_out}, YOLO images:{yolo_images_out}, labels:{yolo_labels_out}, COCO:{coco_path}")
 
     print("\n[COMPLETE] All done.")
-
-# ------------------ CLI ------------------ #
 
 def parse_args():
     p = argparse.ArgumentParser()

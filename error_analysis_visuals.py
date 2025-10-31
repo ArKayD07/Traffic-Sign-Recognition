@@ -13,12 +13,10 @@ def plot_confusion_matrix(cm_path, out_path, class_mapping=None):
     cm = pd.read_csv(cm_path, index_col=0)
     plt.figure(figsize=(12, 10))
 
-    # Prepare tick labels: try to map the matrix's columns/indices to human-readable names
     xticklabels = True
     yticklabels = True
     if class_mapping is not None:
         def map_label(x):
-            # Try string key first, then integer-like
             s = str(x)
             if s in class_mapping:
                 return class_mapping[s]
@@ -33,7 +31,6 @@ def plot_confusion_matrix(cm_path, out_path, class_mapping=None):
         mapped_cols = [map_label(c) for c in cm.columns]
         mapped_idx = [map_label(i) for i in cm.index]
 
-        # Only use as tick labels if sizes match (safety)
         if len(mapped_cols) == cm.shape[1] and len(mapped_idx) == cm.shape[0]:
             xticklabels = mapped_cols
             yticklabels = mapped_idx
@@ -50,16 +47,13 @@ def plot_confusion_matrix(cm_path, out_path, class_mapping=None):
 def plot_classification_report(csv_path, out_path, class_mapping=None):
     df = pd.read_csv(csv_path)
 
-    # identify the column that contains class labels: 'class' or 'label'
     label_col = 'class' if 'class' in df.columns else ('label' if 'label' in df.columns else None)
     if label_col is None:
         raise ValueError("classification report CSV must contain a 'label' or 'class' column")
 
-    # remove aggregate rows commonly named 'accuracy', 'macro avg', 'weighted avg'
     aggregates = {'accuracy', 'macro avg', 'weighted avg'}
     df = df[~df[label_col].isin(aggregates)]
 
-    # map numeric labels to human-friendly names if mapping provided
     def map_label_val(v):
         s = str(v)
         if class_mapping and s in class_mapping:
@@ -93,11 +87,9 @@ def main():
 
     ensure_dir(args.output_dir)
 
-    # Paths
     cm_path = os.path.join(args.results_dir, "confusion_matrix.csv")
     report_csv_path = os.path.join(args.results_dir, "classification_report.csv")
 
-    # Load class names mapping. Prefer CSV with columns 'class_id' and 'class_name'.
     class_mapping = None
     if args.class_names:
         path = args.class_names
@@ -105,10 +97,8 @@ def main():
             try:
                 classes_df = pd.read_csv(path)
                 if 'class_id' in classes_df.columns and 'class_name' in classes_df.columns:
-                    # map numeric IDs to names, store keys as strings for flexible matching
                     class_mapping = {str(int(cid)): name for cid, name in zip(classes_df['class_id'], classes_df['class_name'])}
                 elif 'class_name' in classes_df.columns:
-                    # fallback: use order-based mapping
                     class_mapping = {str(i): name for i, name in enumerate(classes_df['class_name'])}
                 else:
                     print(f"[WARN] CSV provided but expected columns 'class_id' and 'class_name' not found. Columns: {list(classes_df.columns)}")
@@ -125,7 +115,6 @@ def main():
             except Exception as e:
                 print(f"[WARN] Failed to read class names JSON: {e}")
         else:
-            # try CSV then JSON heuristically
             try:
                 classes_df = pd.read_csv(path)
                 if 'class_id' in classes_df.columns and 'class_name' in classes_df.columns:
@@ -141,14 +130,12 @@ def main():
                 except Exception as e:
                     print(f"[WARN] Could not parse class names file: {e}")
 
-    # Plot confusion matrix
     if os.path.exists(cm_path):
         plot_confusion_matrix(cm_path, os.path.join(args.output_dir, "confusion_matrix.png"), class_mapping=class_mapping)
         print(f"[INFO] Confusion matrix saved to {args.output_dir}")
     else:
         print("[WARN] Confusion matrix CSV not found!")
 
-    # Plot classification report (from CSV)
     if os.path.exists(report_csv_path):
         plot_classification_report(report_csv_path, os.path.join(args.output_dir, "classification_report.png"), class_mapping=class_mapping)
         print(f"[INFO] Classification report plots saved to {args.output_dir}")
